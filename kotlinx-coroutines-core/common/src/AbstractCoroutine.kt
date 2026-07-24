@@ -131,6 +131,9 @@ public abstract class AbstractCoroutine<in T>(
      * - [LAZY] does nothing.
      */
     public fun <R> start(start: CoroutineStart, receiver: R, block: suspend R.() -> T) {
-        start(block, receiver, this)
+        // Every coroutine owns a virtual thread, so even UNDISPATCHED must go through dispatch.
+        // ATOMIC retains its guaranteed-start property without borrowing the caller's thread.
+        val effectiveStart = if (start === UNDISPATCHED) ATOMIC else start
+        effectiveStart(block, receiver, this)
     }
 }

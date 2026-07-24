@@ -22,18 +22,22 @@ public fun <T> runBlocking(
 ): T = runBlocking(context, block)
 
 @Throws(InterruptedException::class)
+@Suppress("UNUSED_PARAMETER")
 internal actual fun <T> runBlockingImpl(
     newContext: CoroutineContext, eventLoop: EventLoop?, block: suspend CoroutineScope.() -> T
 ): T {
-    val coroutine = BlockingCoroutine<T>(newContext, Thread.currentThread(), eventLoop)
+    val coroutineContext = newContext.minusKey(ContinuationInterceptor) + Dispatchers.Default
+    val coroutine = BlockingCoroutine<T>(
+        coroutineContext,
+        Thread.currentThread()
+    )
     coroutine.start(CoroutineStart.DEFAULT, coroutine, block)
     return coroutine.joinBlocking()
 }
 
 private class BlockingCoroutine<T>(
     parentContext: CoroutineContext,
-    private val blockedThread: Thread,
-    private val eventLoop: EventLoop?
+    private val blockedThread: Thread
 ) : AbstractCoroutine<T>(parentContext, true, true) {
 
     override val isScopedCoroutine: Boolean get() = true
@@ -48,17 +52,9 @@ private class BlockingCoroutine<T>(
     fun joinBlocking(): T {
         registerTimeLoopThread()
         try {
-            eventLoop?.incrementUseCount()
-            try {
-                while (true) {
-                    val parkNanos = eventLoop?.processNextEvent() ?: Long.MAX_VALUE
-                    // note: process next even may loose unpark flag, so check if completed before parking
-                    if (isCompleted) break
-                    parkNanos(this, parkNanos)
-                    if (Thread.interrupted()) cancelCoroutine(InterruptedException())
-                }
-            } finally { // paranoia
-                eventLoop?.decrementUseCount()
+            while (!isCompleted) {
+                parkNanos(this, Long.MAX_VALUE)
+                if (Thread.interrupted()) cancelCoroutine(InterruptedException())
             }
         } finally { // paranoia
             unregisterTimeLoopThread()
