@@ -49,30 +49,20 @@ public actual fun <T> runBlocking(context: CoroutineContext, block: suspend Coro
     contract {
         callsInPlace(block, InvocationKind.EXACTLY_ONCE)
     }
-    val currentThread = Thread.currentThread()
-    val contextInterceptor = context[ContinuationInterceptor]
-    val eventLoop: EventLoop?
-    val newContext: CoroutineContext
-    if (contextInterceptor == null) {
-        // A coroutine owns a virtual thread instead of borrowing runBlocking's caller thread.
-        eventLoop = null
-        newContext = GlobalScope.newCoroutineContext(context + Dispatchers.Default)
-    } else {
-        // See if context's interceptor is an event loop that we shall use (to support TestContext)
-        // or take an existing thread-local event loop if present to avoid blocking it (but don't create one)
-        eventLoop = (contextInterceptor as? EventLoop)?.takeIf { it.shouldBeProcessedFromContext() }
-            ?: ThreadLocalEventLoop.currentOrNull()
-        newContext = GlobalScope.newCoroutineContext(context)
-    }
-    val coroutine = BlockingCoroutine<T>(newContext, currentThread, eventLoop)
+    val newContext = GlobalScope.newCoroutineContext(
+        context.minusKey(ContinuationInterceptor) + Dispatchers.Default
+    )
+    val coroutine = BlockingCoroutine<T>(
+        newContext,
+        Thread.currentThread()
+    )
     coroutine.start(CoroutineStart.DEFAULT, coroutine, block)
     return coroutine.joinBlocking()
 }
 
 private class BlockingCoroutine<T>(
     parentContext: CoroutineContext,
-    private val blockedThread: Thread,
-    private val eventLoop: EventLoop?
+    private val blockedThread: Thread
 ) : AbstractCoroutine<T>(parentContext, true, true) {
 
     override val isScopedCoroutine: Boolean get() = true
@@ -87,18 +77,9 @@ private class BlockingCoroutine<T>(
     fun joinBlocking(): T {
         registerTimeLoopThread()
         try {
-            eventLoop?.incrementUseCount()
-            try {
-                while (true) {
-                    @Suppress("DEPRECATION")
-                    if (Thread.interrupted()) throw InterruptedException().also { cancelCoroutine(it) }
-                    val parkNanos = eventLoop?.processNextEvent() ?: Long.MAX_VALUE
-                    // note: process next even may loose unpark flag, so check if completed before parking
-                    if (isCompleted) break
-                    parkNanos(this, parkNanos)
-                }
-            } finally { // paranoia
-                eventLoop?.decrementUseCount()
+            while (!isCompleted) {
+                parkNanos(this, Long.MAX_VALUE)
+                if (Thread.interrupted()) cancelCoroutine(InterruptedException())
             }
         } finally { // paranoia
             unregisterTimeLoopThread()
