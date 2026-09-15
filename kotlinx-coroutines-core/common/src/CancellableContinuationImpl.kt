@@ -79,8 +79,6 @@ internal open class CancellableContinuationImpl<in T>(
      */
     private val _state = atomic<Any?>(Active)
 
-    private lateinit var virtualThreadWaiter: VirtualThreadWaiter
-
     /*
      * This field has a concurrent rendezvous in the following scenario:
      *
@@ -213,7 +211,7 @@ internal open class CancellableContinuationImpl<in T>(
             }
             // Complete state update
             detachChildIfNonReusable()
-            wakeCoroutine() // no need for additional cancellation checks
+            dispatchResume(resumeMode) // no need for additional cancellation checks
             return true
         }
     }
@@ -291,7 +289,6 @@ internal open class CancellableContinuationImpl<in T>(
     @PublishedApi
     internal fun getResult(): Any? {
         val isReusable = isReusable()
-        virtualThreadWaiter = VirtualThreadWaiter(context)
         // trySuspend may fail either if 'block' has resumed/cancelled a continuation,
         // or we got async cancellation from parent.
         if (trySuspend()) {
@@ -312,7 +309,10 @@ internal open class CancellableContinuationImpl<in T>(
              * If we were successful, then do nothing, it's ok to reuse the instance now.
              * Otherwise, dispose the handle by ourselves.
             */
-            while (!isCompleted) virtualThreadWaiter.await()
+            if (isReusable) {
+                releaseClaimedReusableContinuation()
+            }
+            return COROUTINE_SUSPENDED
         }
         // otherwise, onCompletionInternal was already invoked & invoked tryResume, and the result is in the state
         if (isReusable) {
@@ -464,10 +464,10 @@ internal open class CancellableContinuationImpl<in T>(
         error("It's prohibited to register multiple handlers, tried to register $handler, already has $state")
     }
 
-    private fun wakeCoroutine() {
+    private fun dispatchResume(mode: Int) {
         if (tryResume()) return // completed before getResult invocation -- bail out
-        // getResult is blocking the coroutine's virtual thread instead of unwinding its stack.
-        virtualThreadWaiter.signal()
+        // otherwise, getResult has already commenced, i.e. completed later or in other thread
+        dispatch(mode)
     }
 
     private fun <R> resumedState(
@@ -501,7 +501,7 @@ internal open class CancellableContinuationImpl<in T>(
                     val update = resumedState(state, proposedUpdate, resumeMode, onCancellation, idempotent = null)
                     if (!_state.compareAndSet(state, update)) return@loop // retry on cas failure
                     detachChildIfNonReusable()
-                    wakeCoroutine()
+                    dispatchResume(resumeMode) // dispatch resume, but it might get cancelled in process
                     return // done
                 }
 
@@ -588,7 +588,7 @@ internal open class CancellableContinuationImpl<in T>(
     // note: token is always RESUME_TOKEN
     override fun completeResume(token: Any) {
         assert { token === RESUME_TOKEN }
-        wakeCoroutine()
+        dispatchResume(resumeMode)
     }
 
     override fun CoroutineDispatcher.resumeUndispatched(value: T) {

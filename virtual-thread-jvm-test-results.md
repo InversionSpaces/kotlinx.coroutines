@@ -1,5 +1,8 @@
 # JVM virtual-thread experiment: test results
 
+> Historical results for the original implementation that blocked inside `CancellableContinuationImpl`.
+> The dedicated virtual-thread worker implementation supersedes that design; these counts do not describe it.
+
 Measured on 2026-07-24 with the JDK 25 JVM test worker. These are preliminary probable causes based on test names and observed failures; they are not deep root-cause investigations.
 
 ## Summary

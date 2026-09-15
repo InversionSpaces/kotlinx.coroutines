@@ -1,34 +1,47 @@
 package kotlinx.coroutines
 
 import java.util.concurrent.*
-import java.util.concurrent.locks.LockSupport
 import kotlin.coroutines.*
 
-/** Base dispatcher for coroutines that own a virtual thread. */
-internal abstract class VirtualThreadDispatcher : ExecutorCoroutineDispatcher() {
-    private companion object {
-        // Reflective so the library can still be compiled to its Java 8 bytecode target. The experiment
-        // itself is exercised on JDK 25, where this method is guaranteed to exist.
-        val executorService =
-            Executors::class.java.getMethod("newVirtualThreadPerTaskExecutor").invoke(null) as ExecutorService
-    }
+/**
+ * A dispatcher that gives each coroutine job a dedicated virtual-thread worker.
+ *
+ * Suspension still uses the regular Kotlin continuation protocol. The worker's JVM stack unwinds and the
+ * virtual thread waits for the next dispatched continuation, so all dispatched segments for one job retain
+ * thread identity without changing suspension or resumption semantics.
+ */
+internal object DefaultVirtualThreadDispatcher : ExecutorCoroutineDispatcher(), CoroutineStartOnDispatcher {
+    private val executorService =
+        Executors::class.java.getMethod("newVirtualThreadPerTaskExecutor").invoke(null) as ExecutorService
 
-    final override val executor: Executor
+    private val workers = ConcurrentHashMap<Job, CoroutineWorker>()
+
+    override val executor: Executor
         get() = executorService
 
-    final override fun dispatch(context: CoroutineContext, block: Runnable) {
-        executorService.execute { runTask(block) }
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        val job = context[Job]
+        if (job == null) {
+            executorService.execute(block)
+            return
+        }
+
+        val task = Task(context, block)
+        while (true) {
+            var created = false
+            val worker = workers.computeIfAbsent(job) {
+                created = true
+                CoroutineWorker(job)
+            }
+            if (worker.enqueue(task)) {
+                if (created) worker.start()
+                return
+            }
+            workers.remove(job, worker)
+        }
     }
 
-    protected open fun runTask(block: Runnable) {
-        block.run()
-    }
-
-    internal open fun releaseForSuspension() {}
-
-    internal open fun reacquireAfterSuspension() {}
-
-    protected fun shutdown() {
+    internal fun shutdownDefault() {
         executorService.shutdown()
     }
 
@@ -36,57 +49,55 @@ internal abstract class VirtualThreadDispatcher : ExecutorCoroutineDispatcher() 
         throw UnsupportedOperationException("Dispatchers.Default cannot be closed")
     }
 
-}
-
-/** The experimental default dispatcher: every dispatched continuation gets a fresh virtual thread. */
-internal object DefaultVirtualThreadDispatcher : VirtualThreadDispatcher() {
-    internal fun shutdownDefault() {
-        shutdown()
-    }
-
     override fun toString(): String = "Dispatchers.Default"
-}
 
-/** A virtual-thread dispatcher whose runnable segments are limited by a fair semaphore. */
-internal class SemaphoreVirtualThreadDispatcher(parallelism: Int) : VirtualThreadDispatcher() {
-    private val semaphore = Semaphore(parallelism, true)
+    private class Task(val context: CoroutineContext, val block: Runnable)
 
-    init {
-        require(parallelism >= 1) { "Expected positive parallelism level, but got $parallelism" }
-    }
+    private class CoroutineWorker(private val job: Job) : Runnable {
+        private val queue = LinkedBlockingQueue<Task>()
+        private val wakeup = Task(EmptyCoroutineContext, Runnable {})
 
-    override fun runTask(block: Runnable) {
-        semaphore.acquireUninterruptibly()
-        try {
-            block.run()
-        } finally {
-            semaphore.release()
+        @Volatile
+        private var completed = false
+
+        private var accepting = true
+
+        fun start() {
+            job.invokeOnCompletion {
+                completed = true
+                queue.offer(wakeup)
+            }
+            executorService.execute(this)
         }
-    }
 
-    override fun releaseForSuspension() {
-        semaphore.release()
-    }
-
-    override fun reacquireAfterSuspension() {
-        semaphore.acquireUninterruptibly()
-    }
-}
-
-internal actual class VirtualThreadWaiter actual constructor(context: CoroutineContext) {
-    private val thread = Thread.currentThread()
-    private val dispatcher = context[ContinuationInterceptor] as? VirtualThreadDispatcher
-
-    actual fun await() {
-        dispatcher?.releaseForSuspension()
-        try {
-            LockSupport.park(this)
-        } finally {
-            dispatcher?.reacquireAfterSuspension()
+        fun enqueue(task: Task): Boolean = synchronized(this) {
+            if (!accepting) return false
+            queue.offer(task)
+            true
         }
-    }
 
-    actual fun signal() {
-        LockSupport.unpark(thread)
+        override fun run() {
+            while (true) {
+                val task = queue.take()
+                if (task !== wakeup) {
+                    try {
+                        task.block.run()
+                    } catch (failure: Throwable) {
+                        handleCoroutineException(task.context, failure)
+                    }
+                }
+
+                if (completed && queue.isEmpty() && stopAccepting()) {
+                    workers.remove(job, this)
+                    return
+                }
+            }
+        }
+
+        private fun stopAccepting(): Boolean = synchronized(this) {
+            if (!completed || queue.isNotEmpty()) return false
+            accepting = false
+            true
+        }
     }
 }
