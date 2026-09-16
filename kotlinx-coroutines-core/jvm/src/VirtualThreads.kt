@@ -1,6 +1,8 @@
 package kotlinx.coroutines
 
 import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.LockSupport
 import kotlin.coroutines.*
 
 /**
@@ -54,50 +56,62 @@ internal object DefaultVirtualThreadDispatcher : ExecutorCoroutineDispatcher(), 
     private class Task(val context: CoroutineContext, val block: Runnable)
 
     private class CoroutineWorker(private val job: Job) : Runnable {
-        private val queue = LinkedBlockingQueue<Task>()
-        private val wakeup = Task(EmptyCoroutineContext, Runnable {})
+        private val queue = ConcurrentLinkedQueue<Task>()
+
+        private val completed = AtomicBoolean(false)
+        private val accepting = AtomicBoolean(true)
 
         @Volatile
-        private var completed = false
-
-        private var accepting = true
+        private var thread: Thread? = null
 
         fun start() {
             job.invokeOnCompletion {
-                completed = true
-                queue.offer(wakeup)
+                completed.set(true)
+                signal()
             }
             executorService.execute(this)
         }
 
-        fun enqueue(task: Task): Boolean = synchronized(this) {
-            if (!accepting) return false
+        fun enqueue(task: Task): Boolean {
+            if (!accepting.get()) return false
             queue.offer(task)
-            true
+            if (!accepting.get()) {
+                queue.remove(task)
+                return false
+            }
+            signal()
+            return true
         }
 
         override fun run() {
+            thread = Thread.currentThread()
             while (true) {
-                val task = queue.take()
-                if (task !== wakeup) {
+                val task = queue.poll()
+                if (task != null) {
                     try {
                         task.block.run()
                     } catch (failure: Throwable) {
                         handleCoroutineException(task.context, failure)
                     }
+                    continue
                 }
 
-                if (completed && queue.isEmpty() && stopAccepting()) {
+                if (completed.get() && stopAccepting()) {
                     workers.remove(job, this)
                     return
                 }
+
+                LockSupport.park(this)
             }
         }
 
-        private fun stopAccepting(): Boolean = synchronized(this) {
-            if (!completed || queue.isNotEmpty()) return false
-            accepting = false
-            true
+        private fun stopAccepting(): Boolean {
+            if (!completed.get() || queue.isNotEmpty()) return false
+            return accepting.compareAndSet(true, false)
+        }
+
+        private fun signal() {
+            thread?.let(LockSupport::unpark)
         }
     }
 }
