@@ -1,7 +1,7 @@
 package kotlinx.coroutines
 
 import java.util.concurrent.*
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.LockSupport
 import kotlin.coroutines.*
 
@@ -58,27 +58,32 @@ internal object DefaultVirtualThreadDispatcher : ExecutorCoroutineDispatcher(), 
     private class CoroutineWorker(private val job: Job) : Runnable {
         private val queue = ConcurrentLinkedQueue<Task>()
 
-        private val completed = AtomicBoolean(false)
-        private val accepting = AtomicBoolean(true)
+        // Counts reserved, queued, and running tasks. CLOSED can only replace a zero count.
+        private val pendingTasks = AtomicInteger(0)
+
+        @Volatile
+        private var completed = false
 
         @Volatile
         private var thread: Thread? = null
 
         fun start() {
             job.invokeOnCompletion {
-                completed.set(true)
+                completed = true
                 signal()
             }
             executorService.execute(this)
         }
 
         fun enqueue(task: Task): Boolean {
-            if (!accepting.get()) return false
-            queue.offer(task)
-            if (!accepting.get()) {
-                queue.remove(task)
-                return false
+            while (true) {
+                val pending = pendingTasks.get()
+                if (pending == CLOSED) return false
+                check(pending < Int.MAX_VALUE) { "Too many pending tasks" }
+                // Reserve before publishing so retirement cannot race with an in-progress enqueue.
+                if (pendingTasks.compareAndSet(pending, pending + 1)) break
             }
+            queue.offer(task)
             signal()
             return true
         }
@@ -92,11 +97,13 @@ internal object DefaultVirtualThreadDispatcher : ExecutorCoroutineDispatcher(), 
                         task.block.run()
                     } catch (failure: Throwable) {
                         handleCoroutineException(task.context, failure)
+                    } finally {
+                        pendingTasks.decrementAndGet()
                     }
                     continue
                 }
 
-                if (completed.get() && stopAccepting()) {
+                if (completed && pendingTasks.compareAndSet(0, CLOSED)) {
                     workers.remove(job, this)
                     return
                 }
@@ -105,13 +112,12 @@ internal object DefaultVirtualThreadDispatcher : ExecutorCoroutineDispatcher(), 
             }
         }
 
-        private fun stopAccepting(): Boolean {
-            if (!completed.get() || queue.isNotEmpty()) return false
-            return accepting.compareAndSet(true, false)
-        }
-
         private fun signal() {
             thread?.let(LockSupport::unpark)
+        }
+
+        private companion object {
+            const val CLOSED = -1
         }
     }
 }
