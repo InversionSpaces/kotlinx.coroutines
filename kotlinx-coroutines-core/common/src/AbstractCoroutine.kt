@@ -131,6 +131,13 @@ public abstract class AbstractCoroutine<in T>(
      * - [LAZY] does nothing.
      */
     public fun <R> start(start: CoroutineStart, receiver: R, block: suspend R.() -> T) {
-        start(block, receiver, this)
+        // A dispatcher with a dedicated worker cannot borrow the caller's thread for an undispatched start.
+        val effectiveStart = if (
+            start === UNDISPATCHED && context[ContinuationInterceptor] is CoroutineStartOnDispatcher
+        ) ATOMIC else start
+        effectiveStart(block, receiver, this)
     }
 }
+
+/** Marker for dispatchers that must also dispatch an explicitly undispatched coroutine start. */
+internal interface CoroutineStartOnDispatcher
